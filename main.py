@@ -1,0 +1,817 @@
+import os
+import re
+import sys
+import socket
+import threading
+import urllib.parse
+from typing import List, Optional, Dict
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+import httpx
+import uvicorn
+
+app = FastAPI(title="DyslexiEase - Dyslexia Learning Assistant")
+
+# Default User Gemini API Key
+DEFAULT_GEMINI_KEY = "AQ.Ab8RN6Jn9cEU4kTUI58FkZWthvE-AEnKPehy_DsToawjgrhuWw"
+
+# Pydantic schemas for FastAPI
+class ComicRequest(BaseModel):
+    text: str
+    mode: Optional[str] = "comic"  # "comic" or "diagram"
+    apiKey: Optional[str] = None
+
+class AnnotationItem(BaseModel):
+    label: str
+    x: float  # Percentage (0 - 100)
+    y: float  # Percentage (0 - 100)
+    description: str
+
+class ComicPanel(BaseModel):
+    panel_number: int
+    text: str
+    caption: str
+    dialogue: str
+    prompt: str
+    image_url: str
+    annotations: Optional[List[AnnotationItem]] = None
+
+class KeywordItem(BaseModel):
+    word: str
+    definition: str
+
+class ComicResponse(BaseModel):
+    panels: List[ComicPanel]
+    keywords: List[KeywordItem]
+
+class RecommendationRequest(BaseModel):
+    text: str
+    apiKey: Optional[str] = None
+
+class RecommendationResource(BaseModel):
+    title: str
+    summary: str
+    url: str
+    source: str
+
+class RecommendationResponse(BaseModel):
+    topic: str
+    recommendations: List[RecommendationResource]
+    subtopics: List[str]
+
+class OCRRequest(BaseModel):
+    image_base64: str
+    apiKey: Optional[str] = None
+
+class OCRResponse(BaseModel):
+    text: str
+
+class ChatMessage(BaseModel):
+    sender: str  # "user" or "pip"
+    text: str
+
+class CorrectionItem(BaseModel):
+    original: str
+    correction: str
+    reason: str
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage]
+    lessonText: str
+    apiKey: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    reply: str
+    corrections: List[CorrectionItem]
+
+class SimplifyRequest(BaseModel):
+    text: str
+    apiKey: Optional[str] = None
+
+class SimplifyResponse(BaseModel):
+    html: str
+
+# Image generation URL helper (overhauled to produce formal 2D textbook schematics)
+def make_pollinations_url(prompt: str) -> str:
+    clean_p = re.sub(r'[^\w\s\-,.]', '', prompt)
+    clean_p = " ".join(clean_p.split()[:20]) # Limit to 20 words
+    style_suffix = ", formal 2D academic block diagram, technical textbook schematic style, clean line art, high contrast, solid white background, no doodles, no cartoon characters"
+    full_prompt = clean_p + style_suffix
+    encoded_prompt = urllib.parse.quote(full_prompt)
+    return f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=600&height=400&nologo=true&private=true"
+
+# Fallback heuristic parser
+def split_text_into_scenes(text: str) -> List[dict]:
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+    
+    if not sentences:
+        sentences = [line.strip() for line in text.split('\n') if len(line.strip()) > 10]
+        
+    sentences = sentences[:6]
+    
+    panels = []
+    for idx, sentence in enumerate(sentences):
+        clean_sentence = sentence.replace('"', '').replace("'", "")
+        stopwords = {"the", "a", "an", "and", "or", "but", "is", "are", "was", "were", "of", "to", "in", "on", "at", "for", "with", "by", "about", "that", "this", "these", "those", "it", "its", "they", "them", "he", "she", "you", "we"}
+        words = re.findall(r'\b[a-zA-Z]{3,}\b', clean_sentence.lower())
+        keywords = [w for w in words if w not in stopwords]
+        
+        if keywords:
+            search_terms = " ".join(keywords[:5])
+            prompt = f"technical 2D schematic diagram of {search_terms}"
+        else:
+            prompt = f"technical 2D block diagram showing {clean_sentence[:50]}"
+            
+        panels.append({
+            "panel_number": idx + 1,
+            "text": sentence,
+            "caption": sentence[:80] + ("..." if len(sentence) > 80 else ""),
+            "dialogue": "",
+            "prompt": prompt
+        })
+    return panels
+
+# Extract keywords using simple heuristics
+def extract_fallback_keywords(text: str) -> List[dict]:
+    dictionary = {
+        "photosynthesis": "The process green plants use to make food using sunlight, water, and air.",
+        "chlorophyll": "The green material in leaves that absorbs sunlight like solar panels.",
+        "gravity": "An invisible pulling force that holds us to the ground and keeps planets orbiting.",
+        "evaporation": "When liquid water heats up and turns into an invisible gas called water vapor.",
+        "condensation": "When water vapor cools down and turns back into liquid water drops, forming clouds.",
+        "precipitation": "Water falling back to the ground as rain, snow, sleet, or hail.",
+        "collection": "When rainwater gathers back into oceans, lakes, and rivers.",
+        "mass": "How much matter or 'stuff' is inside an object, making it heavy.",
+        "orbit": "The circular path an object takes in space around another object, like Earth around the Sun."
+    }
+    
+    found = []
+    text_lower = text.lower()
+    for word, definition in dictionary.items():
+        if word in text_lower:
+            found.append({"word": word, "definition": definition})
+            
+    if not found:
+        words = re.findall(r'\b[a-zA-Z]{7,}\b', text)
+        stopwords = {"sentence", "paragraph", "explanation", "understanding", "materials", "resources"}
+        clean_words = list(set([w.lower() for w in words if w not in stopwords]))[:3]
+        for w in clean_words:
+            found.append({"word": w, "definition": f"An important concept word in this lesson: '{w}'."})
+            
+    return found
+
+# Gemini Visual OCR Logic
+def perform_ocr_logic(image_base64: str, user_api_key: Optional[str] = None) -> str:
+    api_key = user_api_key or os.environ.get("GEMINI_API_KEY") or DEFAULT_GEMINI_KEY
+    
+    mime_type = "image/jpeg"
+    base64_data = image_base64
+    
+    if "," in image_base64:
+        header, base64_data = image_base64.split(",", 1)
+        match = re.search(r"data:([^;]+);base64", header)
+        if match:
+            mime_type = match.group(1)
+            
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": base64_data
+                    }
+                },
+                {
+                    "text": "Extract all readable text from this image page. Return only the extracted raw text, maintaining paragraph formatting. Do not add any conversational headers, footers, markdown code blocks, or chat explanations."
+                }
+            ]
+        }]
+    }
+    
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(url, json=payload, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"Gemini OCR API failed: {response.text}")
+            
+        result = response.json()
+        try:
+            extracted_text = result["candidates"][0]["content"]["parts"][0]["text"]
+            return extracted_text.strip()
+        except Exception as e:
+            raise Exception(f"Failed to parse Gemini OCR response: {str(e)}")
+
+# Improved Picture/Comic & Keyword Generator Logic (Strict 2D textbook diagram prompt rules)
+def generate_comic_logic(text: str, mode: str = "comic", user_api_key: Optional[str] = None) -> dict:
+    api_key = user_api_key or os.environ.get("GEMINI_API_KEY") or DEFAULT_GEMINI_KEY
+    
+    # Extract topic name cleanly for search terms
+    cleaned = re.sub(r'[^\w\s]', '', text)
+    words = cleaned.split()
+    topic = " ".join(words[:4]) if len(words) > 0 else "Lesson Concept"
+    
+    if api_key:
+        try:
+            if mode == "diagram":
+                prompt_instruction = f"""
+                Analyze the following educational text/lesson extract. Your task is to:
+                1. Extract key vocabulary words (1 to 5 words) that are central to understanding the topic, along with simplified, kid-friendly definitions.
+                2. Design a single, high-fidelity labeled/annotated academic diagram or technical infographic that visually summarizes the entire topic.
+                   The 'prompt' for this diagram must describe a formal 2D textbook block diagram, flow schematic, or cross-section.
+                   DO NOT use cartoons, doodles, child-like sketches, or character illustrations. 
+                   The drawing must be a text-free background illustration, showing clear boxes, arrows, lines, and clean layouts.
+                   Always start the prompt with "technical 2D block diagram in clean line art, text-free background schematic showing..." to maintain style.
+                3. Define 3 to 6 spatial annotations/labels to display on top of this drawing. 
+                   For each annotation, specify the 'label' name, the relative coordinates 'x' and 'y' (floating numbers representing percentages from 0 to 100), and a clear 'description' of its function or meaning.
+                   Choose coordinates between 15 and 85 to ensure the text overlays fit cleanly within the diagram canvas.
+                
+                CRITICAL RULE: DO NOT OVER-SIMPLIFY the educational content. Dyslexic students need to learn the exact scientific/academic names, terms, equations, and details to get full marks on their school examinations. Retain and explain these key terms visually in the diagram.
+                
+                Lesson text:
+                "{text}"
+                
+                Respond STRICTLY in JSON format with the following schema:
+                {{
+                  "keywords": [
+                    {{
+                      "word": "keyword",
+                      "definition": "kid-friendly definition explaining what it means"
+                    }}
+                  ],
+                  "panels": [
+                    {{
+                      "panel_number": 1,
+                      "text": "Overall concept summary of the diagram",
+                      "caption": "Narrator caption explaining how to read the diagram",
+                      "dialogue": "",
+                      "prompt": "Highly detailed visual description of the text-free diagram in a clean educational vector style",
+                      "annotations": [
+                        {{
+                          "label": "Mitochondria",
+                          "x": 45.5,
+                          "y": 62.0,
+                          "description": "Powers the cell by generating chemical energy"
+                        }}
+                      ]
+                    }}
+                  ]
+                }}
+                Do not output any markdown formatting, only the JSON block.
+                """
+            else:
+                prompt_instruction = f"""
+                Analyze the following educational text/lesson extract. Your task is to:
+                1. Extract key vocabulary words (1 to 5 words) that are central to understanding the topic, along with simplified, kid-friendly definitions.
+                2. Structure the text into a chronological comic book storyboard of 3 to 6 panels for a dyslexic child.
+                   Each panel must represent a concrete step.
+                   To ensure the image generator (Pollinations AI) creates highly relevant drawings, the 'prompt' for each panel must describe a formal 2D block diagram, flowchart step, or clean textbook line art layout.
+                   DO NOT use cartoons, doodles, child-like sketches, or character illustrations. 
+                   Always start the prompt with "technical 2D block diagram in clean line art, text-free background schematic showing..." to maintain style.
+                
+                CRITICAL RULE: DO NOT OVER-SIMPLIFY the educational content. Dyslexic students need to learn the exact scientific/academic names, terms, equations, and details to get full marks on their school examinations. Retain and explain these key terms visually in the panels rather than abstracting them away.
+                
+                Lesson text:
+                "{text}"
+                
+                Respond STRICTLY in JSON format with the following schema:
+                {{
+                  "keywords": [
+                    {{
+                      "word": "keyword",
+                      "definition": "kid-friendly definition explaining what it means"
+                    }}
+                  ],
+                  "panels": [
+                    {{
+                      "panel_number": 1,
+                      "text": "Concept being explained in this panel",
+                      "caption": "Short narrator caption (1-2 simple sentences)",
+                      "dialogue": "",
+                      "prompt": "Highly detailed visual description of the panel in an educational cartoon style"
+                    }}
+                  ]
+                }}
+                Do not output any markdown formatting, only the JSON block.
+                """
+            
+            headers = {"Content-Type": "application/json"}
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt_instruction}]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }
+            
+            with httpx.Client(timeout=30.0) as client:
+                response = client.post(url, json=payload, headers=headers)
+                if response.status_code == 200:
+                    result = response.json()
+                    raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+                    cleaned_text = re.sub(r"^```json\s*", "", raw_text.strip(), flags=re.IGNORECASE)
+                    cleaned_text = re.sub(r"\s*```$", "", cleaned_text.strip())
+                    
+                    import json
+                    data = json.loads(cleaned_text)
+                    
+                    panels = []
+                    for item in data.get("panels", []):
+                        anns = []
+                        for ann in item.get("annotations", []):
+                            anns.append({
+                                "label": ann.get("label", ""),
+                                "x": float(ann.get("x", 50.0)),
+                                "y": float(ann.get("y", 50.0)),
+                                "description": ann.get("description", "")
+                            })
+                            
+                        panels.append({
+                            "panel_number": item.get("panel_number", len(panels) + 1),
+                            "text": item.get("text", ""),
+                            "caption": item.get("caption", ""),
+                            "dialogue": item.get("dialogue", ""),
+                            "prompt": item.get("prompt", ""),
+                            "image_url": make_pollinations_url(item.get("prompt", "")),
+                            "annotations": anns if anns else None
+                        })
+                    
+                    keywords = []
+                    for k in data.get("keywords", []):
+                        keywords.append({
+                            "word": k.get("word", ""),
+                            "definition": k.get("definition", "")
+                        })
+                        
+                    return {"panels": panels, "keywords": keywords}
+        except Exception as e:
+            print(f"Gemini generation failed: {e}. Falling back to heuristics.")
+            
+    # Fallback/Heuristic Mode
+    keywords = extract_fallback_keywords(text)
+    
+    if mode == "diagram":
+        # Dynamic fallback diagram: exactly one panel with coordinates overlays
+        prompt = f"technical 2D block diagram in clean line art, text-free background schematic showing overall visual structure of {topic}"
+        coords = [(20, 25), (78, 30), (28, 72), (72, 75), (50, 48)]
+        anns = []
+        for i, k in enumerate(keywords[:5]):
+            x, y = coords[i]
+            anns.append({
+                "label": k["word"],
+                "x": x,
+                "y": y,
+                "description": k["definition"]
+            })
+            
+        panels = [{
+            "panel_number": 1,
+            "text": f"Overall concept diagram for {topic}.",
+            "caption": f"Explore the details of {topic} by hovering over the labels.",
+            "dialogue": "",
+            "prompt": prompt,
+            "image_url": make_pollinations_url(prompt),
+            "annotations": anns if anns else None
+        }]
+    else:
+        # Storyboard Mode: sequential distinct steps
+        raw_panels = split_text_into_scenes(text)
+        panels = []
+        for idx, item in enumerate(raw_panels):
+            # Include unique step indices and sentence texts to force distinct image generation!
+            unique_prompt = f"{item['prompt']} step {idx + 1} explaining {item['text'][:60]}"
+            panels.append({
+                "panel_number": item["panel_number"],
+                "text": item["text"],
+                "caption": item["caption"],
+                "dialogue": "",
+                "prompt": unique_prompt,
+                "image_url": make_pollinations_url(unique_prompt),
+                "annotations": None
+            })
+            
+    return {"panels": panels, "keywords": keywords}
+
+
+def get_recommendations_logic(text: str, user_api_key: Optional[str] = None) -> dict:
+    api_key = user_api_key or os.environ.get("GEMINI_API_KEY") or DEFAULT_GEMINI_KEY
+    topic = "General Subject"
+    subtopics = ["Introduction", "Key Terms", "Examples", "Visual Summary"]
+    
+    if api_key:
+        try:
+            prompt_instruction = f"""
+            Analyze the following text and return:
+            1. The core educational topic or concept title (e.g., "The Water Cycle", "Photosynthesis", "Ancient Egypt").
+            2. List of 4 related topics or terms that would help a student expand their knowledge on this topic.
+            
+            Text: "{text}"
+            
+            Respond STRICTLY in JSON format with the following schema:
+            {{
+              "topic": "extracted main topic",
+              "subtopics": ["subtopic 1", "subtopic 2", "subtopic 3", "subtopic 4"]
+            }}
+            Do not output markdown, just JSON.
+            """
+            headers = {"Content-Type": "application/json"}
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt_instruction}]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }
+            
+            with httpx.Client(timeout=15.0) as client:
+                response = client.post(url, json=payload, headers=headers)
+                if response.status_code == 200:
+                    result = response.json()
+                    raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+                    cleaned_text = re.sub(r"^```json\s*", "", raw_text.strip(), flags=re.IGNORECASE)
+                    cleaned_text = re.sub(r"\s*```$", "", cleaned_text.strip())
+                    
+                    import json
+                    data = json.loads(cleaned_text)
+                    topic = data.get("topic", "General Subject")
+                    subtopics = data.get("subtopics", subtopics)
+        except Exception as e:
+            print(f"Gemini topic extraction failed: {e}")
+            
+    if topic == "General Subject":
+        cleaned = re.sub(r'[^\w\s]', '', text)
+        words = cleaned.split()
+        if len(words) > 0:
+            topic = " ".join(words[:4])
+            
+    # Search for and prioritize curriculum-aligned revision links
+    topic_query = urllib.parse.quote(topic)
+    
+    bbc_link = {
+        "title": f"BBC Bitesize Revision - '{topic}'",
+        "summary": "Study guides, curriculum notes, interactive tests, and revision tools for this topic under the UK national curriculum.",
+        "url": f"https://www.google.com/search?q=site:bbc.co.uk/bitesize+{topic_query}",
+        "source": "BBC Bitesize"
+    }
+    
+    pmt_link = {
+        "title": f"Physics & Maths Tutor (PMT) - '{topic}' study guide",
+        "summary": "A-level and GCSE study summaries, exam question sheets, and detailed past papers revision guides.",
+        "url": f"https://www.google.com/search?q=site:physicsandmathstutor.com+{topic_query}",
+        "source": "Physics & Maths Tutor"
+    }
+    
+    savemyexams_link = {
+        "title": f"Save My Exams - Revision notes for '{topic}'",
+        "summary": "Comprehensive revision notes, topic questions, and model answers built by teachers for exam preparation.",
+        "url": f"https://www.google.com/search?q=site:savemyexams.com+{topic_query}",
+        "source": "Save My Exams"
+    }
+    
+    khan_link = {
+        "title": f"Khan Academy Course - '{topic}' lectures",
+        "summary": "Detailed video lectures, practice exercises, and step-by-step progress tracking for standard curriculum topics.",
+        "url": f"https://www.khanacademy.org/search?referer=%2F&page_search_query={topic_query}",
+        "source": "Khan Academy"
+    }
+    
+    resources = [bbc_link, pmt_link, savemyexams_link, khan_link]
+    
+    return {
+        "topic": topic,
+        "recommendations": resources,
+        "subtopics": subtopics
+    }
+
+# Conversational AI Tutor Chat Logic
+def chat_with_tutor_logic(message: str, history: List[dict], lesson_text: str, user_api_key: Optional[str] = None) -> dict:
+    api_key = user_api_key or os.environ.get("GEMINI_API_KEY") or DEFAULT_GEMINI_KEY
+    
+    # Format chat history context
+    history_formatted = ""
+    for msg in history[-8:]:
+        role = "Student" if msg.get("sender") == "user" else "Pip (AI Tutor)"
+        history_formatted += f"{role}: {msg.get('text')}\n"
+        
+    prompt_instruction = f"""
+    You are 'Pip', a friendly, warm, and encouraging AI study buddy helping a student learn.
+    The student is currently studying the following lesson:
+    "{lesson_text}"
+    
+    Here is the recent conversation history:
+    {history_formatted}
+    
+    Student's new message:
+    "{message}"
+    
+    Your tasks:
+    1. DYNAMIC INTELLIGENCE: Auto-detect the educational level of the student's writing and the lesson text. If the student writes simply, match their level. If they write at a college/university level, match that exact tier of academic detail, vocabulary, and conceptual rigor. Do not over-simplify.
+    2. LANGUAGE HELPER: Scan the student's message ("{message}") for any spelling mistakes, syntax errors, or awkward sentence structures. 
+       Return corrections in a non-invasive way in the "corrections" array. For each correction, specify the exact "original" misspelled/awkward text segment, the suggested "correction", and a clear "reason" why it was corrected. Only correct actual errors or very clumsy phrasing; do not be overly picky.
+    3. PIP'S RESPONSE: Reply to the student's message. Speak in an encouraging, engaging, and friendly tone. Help them review the concepts and correct any theoretical misunderstandings.
+    
+    You MUST respond STRICTLY in JSON format with the following schema:
+    {{
+      "reply": "Pip's conversational reply (under 120 words, standard plain text, no markdown headers)",
+      "corrections": [
+        {{
+          "original": "incorrect segment from student's message",
+          "correction": "corrected replacement",
+          "reason": "Clear explanation of spelling/grammar mistake"
+        }}
+      ]
+    }}
+    Do not output any markdown wrapper around the JSON. Return only the raw JSON block.
+    """
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_instruction}]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json"
+        }
+    }
+    
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(url, json=payload, headers=headers)
+            if response.status_code == 200:
+                result = response.json()
+                raw_json = result["candidates"][0]["content"]["parts"][0]["text"]
+                cleaned_text = re.sub(r"^```json\s*", "", raw_json.strip(), flags=re.IGNORECASE)
+                cleaned_text = re.sub(r"\s*```$", "", cleaned_text.strip())
+                
+                import json
+                return json.loads(cleaned_text)
+            else:
+                print(f"Gemini API returned status {response.status_code}. Using local offline fallback.")
+                return chat_with_tutor_offline_fallback(message, lesson_text)
+    except Exception as e:
+        print(f"Gemini chat failed: {e}. Using local offline fallback.")
+        return chat_with_tutor_offline_fallback(message, lesson_text)
+
+def chat_with_tutor_offline_fallback(message: str, lesson_text: str) -> dict:
+    msg = message.lower()
+    lesson_lower = lesson_text.lower()
+    
+    # 1. Spelling/grammar check helper
+    corrections = []
+    words = re.findall(r'\b[a-zA-Z]+\b', message)
+    common_mistakes = {
+        "recieve": ("receive", "Remember: 'i' before 'e' except after 'c'."),
+        "seperate": ("separate", "Remember: there is 'a rat' in sep-a-rat-e."),
+        "untill": ("until", "Until is spelled with only one 'l'."),
+        "truely": ("truly", "Drop the 'e' when adding 'ly' to true."),
+        "definately": ("definitely", "Def-i-nite-ly has an 'i' before the 't'."),
+        "goverment": ("government", "Remember the silent 'n' after the 'r'."),
+        "enviroment": ("environment", "Remember the silent 'n' after the 'r'."),
+        "dont": ("don't", "Missing apostrophe for contraction."),
+        "cant": ("can't", "Missing apostrophe for contraction."),
+        "its": ("it's", "If you mean 'it is', you need an apostrophe. If you mean possessive, 'its' is correct.")
+    }
+    
+    for w in words:
+        wl = w.lower()
+        if wl in common_mistakes:
+            corr, reason = common_mistakes[wl]
+            if w.istitle():
+                corr = corr.capitalize()
+            elif w.isupper():
+                corr = corr.upper()
+            corrections.append({
+                "original": w,
+                "correction": corr,
+                "reason": reason
+            })
+            
+    # 2. Heuristic educational chatbot response matching key academic terms
+    dictionary = {
+        "photosynthesis": "Photosynthesis is the process green plants use to convert carbon dioxide and water into oxygen and glucose food using light.",
+        "mitochondria": "Mitochondria are the energy-producing powerhouses of cells, creating chemical energy (ATP).",
+        "cpu": "The CPU (Central Processing Unit) acts as the brain of the computer, running cycles of Fetching, Decoding, and Executing instructions.",
+        "water": "Water moves through a continuous cycle of Evaporation, Condensation, and Precipitation on Earth.",
+        "gravity": "Gravity is the invisible force pulling massive objects together. The larger the mass, the stronger the pull.",
+        "cell": "A cell is the basic structural and functional unit of all living organisms."
+    }
+    
+    matched_term = None
+    for term, desc in dictionary.items():
+        if term in msg or term in lesson_lower:
+            matched_term = (term, desc)
+            break
+            
+    if "hello" in msg or "hi" in msg:
+        reply = "Hi there! I am Pip, your study buddy! Let's explore your lesson together. What specific parts should we talk about?"
+    elif "explain" in msg or "what is" in msg or "how does" in msg:
+        if matched_term:
+            reply = f"Great question! In this topic, {matched_term[0]} is a key concept. Remember: {matched_term[1]} How does that link to the lesson text you're reading?"
+        else:
+            sentences = [s.strip() for s in re.split(r'[.!?]', lesson_text) if len(s.strip()) > 12]
+            if sentences:
+                reply = f"Let's look at this crucial detail from the lesson: '{sentences[0]}'. Why do you think this is key to understanding the topic?"
+            else:
+                reply = "I'd be happy to explain! Tell me, which word or concept in this lesson feels a bit tricky for you?"
+    elif "help" in msg:
+        reply = "I am right here! We can break down the text, look at the visual diagrams, or test ourselves in the Practice Game. What would you like to do first?"
+    else:
+        if matched_term:
+            reply = f"That makes sense. Keep in mind that {matched_term[0]} is a major concept here. Would you like me to quiz you on this?"
+        else:
+            reply = "That is a great thought! Can you try explaining that concept in your own words? Putting it in your own words is a fantastic way to study."
+            
+    return {
+        "reply": reply,
+        "corrections": corrections
+    }
+
+# AI Simplify Layout Logic
+def simplify_layout_logic(text: str, user_api_key: Optional[str] = None) -> str:
+    api_key = user_api_key or os.environ.get("GEMINI_API_KEY") or DEFAULT_GEMINI_KEY
+    
+    prompt_instruction = f"""
+    You are an expert accessibility layout designer specializing in dyslexia.
+    Your task is to take the following lesson text and format the layout so it is highly readable, spaced out, and visually clear for a dyslexic reader.
+    
+    CRITICAL INTELLIGENCE RULE: Auto-detect the educational level of the input text (e.g. elementary school science vs. university-level biology or math). Do not over-simplify or remove details that are required to get full marks on a school/college exam at that level. Keep the academic content identical, but format the layout.
+    
+    Formatting rules:
+    1. Break down long paragraphs into short, focused sentences.
+    2. Use clear section headers and bullet points.
+    3. Put key academic vocabulary terms in bold.
+    4. Space the text out vertically using empty lines to reduce visual crowding.
+    
+    Lesson text:
+    "{text}"
+    
+    Respond STRICTLY in clean HTML format (only using <h3>, <p>, <ul>, <li>, and <strong> tags). Do not wrap the response in markdown code blocks, return the raw HTML code directly.
+    """
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt_instruction}]
+        }]
+    }
+    
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.post(url, json=payload, headers=headers)
+            if response.status_code == 200:
+                result = response.json()
+                html = result["candidates"][0]["content"]["parts"][0]["text"]
+                html_clean = re.sub(r"^```html\s*", "", html.strip(), flags=re.IGNORECASE)
+                html_clean = re.sub(r"\s*```$", "", html_clean.strip())
+                return html_clean
+            else:
+                raise Exception(f"Layout engine returned code: {response.status_code}")
+    except Exception as e:
+        paragraphs = text.strip().split("\n\n")
+        html_fallback = ""
+        for p in paragraphs:
+            html_fallback += f"<p>{p.replace('\n', '<br>')}</p>"
+        return html_fallback
+
+# --- FastAPI Endpoints ---
+@app.post("/api/generate-comic", response_model=ComicResponse)
+async def api_generate_comic(request: ComicRequest):
+    data = generate_comic_logic(request.text, request.mode, request.apiKey)
+    return ComicResponse(
+        panels=[ComicPanel(**p) for p in data["panels"]],
+        keywords=[KeywordItem(**k) for k in data["keywords"]]
+    )
+
+@app.post("/api/recommendations", response_model=RecommendationResponse)
+async def api_recommendations(request: RecommendationRequest):
+    data = get_recommendations_logic(request.text, request.apiKey)
+    return RecommendationResponse(
+        topic=data["topic"],
+        recommendations=[RecommendationResource(**r) for r in data["recommendations"]],
+        subtopics=data["subtopics"]
+    )
+
+@app.post("/api/ocr", response_model=OCRResponse)
+async def api_ocr(request: OCRRequest):
+    try:
+        text = perform_ocr_logic(request.image_base64, request.apiKey)
+        return OCRResponse(text=text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/chat-tutor", response_model=ChatResponse)
+async def api_chat_tutor(request: ChatRequest):
+    history_dicts = [h.dict() for h in request.history]
+    data = chat_with_tutor_logic(request.message, history_dicts, request.lessonText, request.apiKey)
+    return ChatResponse(
+        reply=data.get("reply", ""),
+        corrections=[CorrectionItem(**c) for c in data.get("corrections", [])]
+    )
+
+@app.post("/api/simplify", response_model=SimplifyResponse)
+async def api_simplify(request: SimplifyRequest):
+    html = simplify_layout_logic(request.text, request.apiKey)
+    return SimplifyResponse(html=html)
+
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+@app.get("/")
+async def get_index():
+    return FileResponse(os.path.join(static_dir, "index.html"))
+
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# --- PyWebView Native Desktop Bridge ---
+class DesktopApi:
+    def generate_comic(self, text, mode="comic", apiKey=None):
+        try:
+            return generate_comic_logic(text, mode, apiKey)
+        except Exception as e:
+            return {"error": str(e), "panels": [], "keywords": []}
+            
+    def get_recommendations(self, text, apiKey=None):
+        try:
+            return get_recommendations_logic(text, apiKey)
+        except Exception as e:
+            return {"error": str(e), "topic": "Error", "recommendations": [], "subtopics": []}
+            
+    def extract_text_from_image(self, image_base64, apiKey=None):
+        try:
+            extracted_text = perform_ocr_logic(image_base64, apiKey)
+            return {"text": extracted_text}
+        except Exception as e:
+            return {"error": str(e), "text": ""}
+            
+    def chat_with_tutor(self, message, history, lessonText, apiKey=None):
+        try:
+            return chat_with_tutor_logic(message, history, lessonText, apiKey)
+        except Exception as e:
+            return {"error": str(e), "reply": "Oops! I encountered an error. Let's try chatting again.", "corrections": []}
+            
+    def simplify_layout(self, text, apiKey=None):
+        try:
+            html = simplify_layout_logic(text, apiKey)
+            return {"html": html}
+        except Exception as e:
+            return {"error": str(e), "html": ""}
+
+def get_free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+def run_desktop():
+    try:
+        import webview
+        port = get_free_port()
+        
+        config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        
+        thread = threading.Thread(target=server.run)
+        thread.daemon = True
+        thread.start()
+        
+        print(f"Secure background server initialized on http://127.0.0.1:{port}")
+        print("Launching DyslexiEase Standalone Desktop Application Window...")
+        
+        api = DesktopApi()
+        webview.create_window(
+            title="DyslexiEase - Standalone Learning Assistant", 
+            url=f"http://127.0.0.1:{port}", 
+            js_api=api,
+            width=1280, 
+            height=850,
+            min_size=(900, 600)
+        )
+        webview.start()
+        return True
+    except Exception as e:
+        print(f"Failed to start PyWebView desktop app: {e}")
+        return False
+
+if __name__ == "__main__":
+    if "--server" in sys.argv:
+        print("Starting local Fallback Server on 127.0.0.1:8000...")
+        uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    else:
+        success = run_desktop()
+        if not success:
+            print("\nFalling back to local FastAPI web server...")
+            print("Access locally in browser at: http://127.0.0.1:8000")
+            print("To stop, press Ctrl+C in this terminal.\n")
+            uvicorn.run("main:app", host="127.0.0.1", port=8000)
